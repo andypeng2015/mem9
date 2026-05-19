@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -85,10 +86,97 @@ type webhookPayload struct {
 	Metadata  map[string]interface{} `json:"metadata"`
 }
 
+type fakeConsoleStore struct {
+	mu            sync.Mutex
+	upserted      []string
+	done          []string
+	terminal      []string
+	retryFailures []string
+	noDeadline    int
+}
+
+func (s *fakeConsoleStore) UpsertMeteringPending(ctx context.Context, evt Event, _ []byte, _ string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recordDeadlineLocked(ctx)
+	s.upserted = append(s.upserted, evt.OperationID)
+	return nil
+}
+
+func (s *fakeConsoleStore) MarkMeteringDone(ctx context.Context, operationID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recordDeadlineLocked(ctx)
+	s.done = append(s.done, operationID)
+	return nil
+}
+
+func (s *fakeConsoleStore) MarkMeteringTerminalFailed(ctx context.Context, operationID, _ string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recordDeadlineLocked(ctx)
+	s.terminal = append(s.terminal, operationID)
+	return nil
+}
+
+func (s *fakeConsoleStore) MarkMeteringRetryableFailure(ctx context.Context, operationID, _ string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recordDeadlineLocked(ctx)
+	s.retryFailures = append(s.retryFailures, operationID)
+	return nil
+}
+
+func (s *fakeConsoleStore) recordDeadlineLocked(ctx context.Context) {
+	if _, ok := ctx.Deadline(); !ok {
+		s.noDeadline++
+	}
+}
+
+func (s *fakeConsoleStore) counts() (upserted, done, terminal, retry int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.upserted), len(s.done), len(s.terminal), len(s.retryFailures)
+}
+
+func (s *fakeConsoleStore) noDeadlineCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.noDeadline
+}
+
 func newTestLogger() (*slog.Logger, *bytes.Buffer) {
 	buf := &bytes.Buffer{}
 	logger := slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	return logger, buf
+}
+
+func waitForConsoleStore(t *testing.T, store *fakeConsoleStore, wantDone int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		_, done, _, _ := store.counts()
+		if done == wantDone {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	upserted, done, terminal, retry := store.counts()
+	t.Fatalf("timed out waiting for done=%d; got upserted=%d done=%d terminal=%d retry=%d", wantDone, upserted, done, terminal, retry)
+}
+
+func waitForConsoleTerminal(t *testing.T, store *fakeConsoleStore, wantTerminal int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		_, _, terminal, _ := store.counts()
+		if terminal == wantTerminal {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	upserted, done, terminal, retry := store.counts()
+	t.Fatalf("timed out waiting for terminal=%d; got upserted=%d done=%d terminal=%d retry=%d", wantTerminal, upserted, done, terminal, retry)
 }
 
 func decodePayload(t *testing.T, body []byte) s3Payload {
@@ -843,6 +931,204 @@ func TestRecord_MalformedEvent_DroppedSilently(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "channel full") || strings.Contains(buf.String(), "flush failed") {
 		t.Fatalf("unexpected logs for malformed events: %q", buf.String())
+	}
+}
+
+func TestConsoleRuntimeWriter_SendsConsoleShapeAndMarksDone(t *testing.T) {
+	var (
+		gotMethod string
+		gotPath   string
+		gotAuth   string
+		gotAPIKey string
+		gotBody   map[string]any
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		gotAPIKey = r.Header.Get("X-API-Key")
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"accepted"}`))
+	}))
+	defer server.Close()
+
+	store := &fakeConsoleStore{}
+	logger, _ := newTestLogger()
+	writer, err := NewConsoleRuntime(ConsoleRuntimeConfig{
+		BaseURL:        server.URL + "/",
+		InternalSecret: "internal-secret",
+		Timeout:        time.Second,
+		Store:          store,
+	}, logger)
+	if err != nil {
+		t.Fatalf("NewConsoleRuntime: %v", err)
+	}
+	defer writer.Close(context.Background())
+
+	writer.Record(Event{
+		TenantID:      "tenant-a",
+		ClusterID:     "cluster-a",
+		AgentID:       "Codex",
+		OperationID:   "018f7f3a-7b8c-7c2d-9a5b-6d7e8f901234",
+		APIKeySubject: "tenant-a",
+		EventType:     "memoryRecall",
+		Meter:         "memory_recall_requests",
+		Units:         1,
+		OccurredAt:    time.Date(2026, 5, 13, 1, 2, 3, 123, time.UTC),
+		MemoryIDs:     []string{"mem-1", "mem-2"},
+		Metadata:      map[string]any{"objectsAffected": int64(2)},
+	})
+
+	waitForConsoleStore(t, store, 1, time.Second)
+	upserted, done, terminal, retry := store.counts()
+	if upserted != 1 || done != 1 || terminal != 0 || retry != 0 {
+		t.Fatalf("store counts = upserted=%d done=%d terminal=%d retry=%d", upserted, done, terminal, retry)
+	}
+	if store.noDeadlineCount() != 0 {
+		t.Fatalf("store calls without deadline = %d, want 0", store.noDeadlineCount())
+	}
+	if gotMethod != http.MethodPut {
+		t.Fatalf("method = %s, want PUT", gotMethod)
+	}
+	if gotPath != "/api/internal/metering/events/018f7f3a-7b8c-7c2d-9a5b-6d7e8f901234" {
+		t.Fatalf("path = %q", gotPath)
+	}
+	if gotAuth != "Bearer internal-secret" {
+		t.Fatalf("Authorization = %q", gotAuth)
+	}
+	if gotAPIKey != "tenant-a" {
+		t.Fatalf("X-API-Key = %q", gotAPIKey)
+	}
+	if gotBody["eventType"] != "memoryRecall" || gotBody["meter"] != "memory_recall_requests" || gotBody["agentName"] != "Codex" {
+		t.Fatalf("unexpected body: %+v", gotBody)
+	}
+	if gotBody["units"] != float64(1) {
+		t.Fatalf("units = %#v, want 1", gotBody["units"])
+	}
+	if gotBody["occurredAt"] != "2026-05-13T01:02:03Z" {
+		t.Fatalf("occurredAt = %#v, want whole-second RFC3339", gotBody["occurredAt"])
+	}
+	metadata, ok := gotBody["metadata"].(map[string]any)
+	if !ok || metadata["objectsAffected"] != float64(2) {
+		t.Fatalf("metadata = %#v, want objectsAffected=2", gotBody["metadata"])
+	}
+}
+
+func TestConsoleRuntimeWriter_ConflictMarksTerminalEvenWithDedupedBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"status":"accepted","deduped":true}`))
+	}))
+	defer server.Close()
+
+	store := &fakeConsoleStore{}
+	logger, _ := newTestLogger()
+	writer, err := NewConsoleRuntime(ConsoleRuntimeConfig{
+		BaseURL:        server.URL,
+		InternalSecret: "internal-secret",
+		Timeout:        time.Second,
+		Store:          store,
+	}, logger)
+	if err != nil {
+		t.Fatalf("NewConsoleRuntime: %v", err)
+	}
+	defer writer.Close(context.Background())
+
+	writer.Record(Event{
+		TenantID:      "tenant-a",
+		ClusterID:     "cluster-a",
+		AgentID:       "Codex",
+		OperationID:   "018f7f3a-7b8c-7c2d-9a5b-6d7e8f901234",
+		APIKeySubject: "tenant-a",
+		EventType:     "memoryRecall",
+		Meter:         "memory_recall_requests",
+		Units:         1,
+		OccurredAt:    time.Date(2026, 5, 13, 1, 2, 3, 0, time.UTC),
+	})
+
+	waitForConsoleTerminal(t, store, 1, time.Second)
+	upserted, done, terminal, retry := store.counts()
+	if upserted != 1 || done != 0 || terminal != 1 || retry != 0 {
+		t.Fatalf("store counts = upserted=%d done=%d terminal=%d retry=%d", upserted, done, terminal, retry)
+	}
+}
+
+func TestConsoleRuntimeWriter_PayloadHashIncludesAPIKeySubject(t *testing.T) {
+	w := &consoleRuntimeWriter{}
+	evt := Event{
+		OperationID:   "018f7f3a-7b8c-7c2d-9a5b-6d7e8f901234",
+		APIKeySubject: "api-key-a",
+		EventType:     "memoryRecall",
+		Meter:         "memory_recall_requests",
+		Units:         1,
+		OccurredAt:    time.Date(2026, 5, 13, 1, 2, 3, 0, time.UTC),
+		AgentID:       "Codex",
+		MemoryIDs:     []string{"mem-1"},
+	}
+
+	first, err := w.makeQueuedEvent(evt)
+	if err != nil {
+		t.Fatalf("makeQueuedEvent first: %v", err)
+	}
+	evt.APIKeySubject = "api-key-b"
+	second, err := w.makeQueuedEvent(evt)
+	if err != nil {
+		t.Fatalf("makeQueuedEvent second: %v", err)
+	}
+
+	if first.payloadHash == second.payloadHash {
+		t.Fatalf("payload hash did not change when APIKeySubject changed: %s", first.payloadHash)
+	}
+	if !bytes.Equal(first.payloadJSON, second.payloadJSON) {
+		t.Fatalf("runtime usage payload JSON changed with APIKeySubject: first=%s second=%s", first.payloadJSON, second.payloadJSON)
+	}
+}
+
+func TestConsoleRuntimeWriter_OmitsInvalidAgentNameAndCapsMemoryIDs(t *testing.T) {
+	w := &consoleRuntimeWriter{}
+	ids := make([]string, 0, 205)
+	for i := 0; i < 205; i++ {
+		ids = append(ids, fmt.Sprintf("mem-%d", i))
+	}
+	evt := Event{
+		OperationID:   "018f7f3a-7b8c-7c2d-9a5b-6d7e8f901234",
+		APIKeySubject: "api-key-a",
+		EventType:     "memoryCreated",
+		Meter:         "memory_write_requests",
+		Units:         1,
+		OccurredAt:    time.Date(2026, 5, 13, 1, 2, 3, 0, time.UTC),
+		AgentID:       "@codex",
+		MemoryIDs:     ids,
+		Metadata: map[string]any{
+			"objectsAffected": 205,
+			"authorization":   "Bearer secret",
+		},
+	}
+
+	item, err := w.makeQueuedEvent(evt)
+	if err != nil {
+		t.Fatalf("makeQueuedEvent: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(item.payloadJSON, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if _, ok := payload["agentName"]; ok {
+		t.Fatalf("agentName present in payload: %+v", payload)
+	}
+	memoryIDs, ok := payload["memoryIds"].([]any)
+	if !ok || len(memoryIDs) != 200 {
+		t.Fatalf("memoryIds len = %d, want 200", len(memoryIDs))
+	}
+	metadata, ok := payload["metadata"].(map[string]any)
+	if !ok || metadata["objectsAffected"] != float64(205) {
+		t.Fatalf("metadata = %#v, want objectsAffected=205", payload["metadata"])
+	}
+	if _, ok := metadata["authorization"]; ok {
+		t.Fatalf("sensitive metadata was retained: %+v", metadata)
 	}
 }
 
