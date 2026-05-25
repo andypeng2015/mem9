@@ -539,6 +539,7 @@ func (s *Server) listMemories(w http.ResponseWriter, r *http.Request) {
 		SessionID:  q.Get("session_id"),
 		Limit:      limit,
 		Offset:     offset,
+		ScanAll:    parseBoolQuery(q.Get("scanAll")),
 	}
 	onlySession := filter.MemoryType == string(domain.TypeSession)
 
@@ -572,6 +573,8 @@ func (s *Server) listMemories(w http.ResponseWriter, r *http.Request) {
 			filter.MemoryType == string(domain.TypePinned) ||
 			filter.MemoryType == string(domain.TypeInsight)):
 			memories, total, err = s.singlePoolConfidenceRecallSearch(r.Context(), auth, svc, filter)
+		case onlySession:
+			memories, total, err = svc.session.List(r.Context(), filter)
 		case !onlySession:
 			memories, total, err = svc.memory.Search(r.Context(), filter)
 		}
@@ -622,6 +625,11 @@ func (s *Server) listMemories(w http.ResponseWriter, r *http.Request) {
 		Limit:    limit,
 		Offset:   offset,
 	})
+}
+
+func parseBoolQuery(value string) bool {
+	parsed, err := strconv.ParseBool(strings.TrimSpace(value))
+	return err == nil && parsed
 }
 
 func normalizeRecallQuery(query string, now time.Time) string {
@@ -716,6 +724,12 @@ func (s *Server) getMemory(w http.ResponseWriter, r *http.Request) {
 
 	svc := s.resolveServices(auth)
 	mem, err := svc.memory.Get(r.Context(), id)
+	if errors.Is(err, domain.ErrNotFound) {
+		mem, err = svc.session.Get(r.Context(), id)
+		if errors.Is(err, domain.ErrNotSupported) {
+			err = domain.ErrNotFound
+		}
+	}
 	if err != nil {
 		s.handleError(r.Context(), w, err)
 		return
@@ -856,7 +870,7 @@ func (s *Server) deleteMemory(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
 	if auth.IsChain() {
-		target, err := s.findChainMemoryTarget(r.Context(), auth, id)
+		target, err := s.findChainDeleteTarget(r.Context(), auth, id)
 		if err != nil {
 			s.handleError(r.Context(), w, err)
 			return
@@ -876,6 +890,9 @@ func (s *Server) deleteMemory(w http.ResponseWriter, r *http.Request) {
 			}()
 		}
 		deleted, err := target.svc.memory.Delete(r.Context(), id, auth.AgentName)
+		if errors.Is(err, domain.ErrNotFound) {
+			deleted, err = target.svc.session.Delete(r.Context(), id, auth.AgentName)
+		}
 		if err != nil {
 			if s.runtimeUsageEnabled() {
 				s.runtimeUsage.AfterMemoryDeleteFailure(context.Background(), lease, err)
@@ -926,6 +943,12 @@ func (s *Server) deleteMemory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	deleted, err := svc.memory.Delete(r.Context(), id, auth.AgentName)
+	if errors.Is(err, domain.ErrNotFound) {
+		deleted, err = svc.session.Delete(r.Context(), id, auth.AgentName)
+		if errors.Is(err, domain.ErrNotSupported) {
+			err = domain.ErrNotFound
+		}
+	}
 	if err != nil {
 		if s.runtimeUsageEnabled() {
 			s.runtimeUsage.AfterMemoryDeleteFailure(context.Background(), lease, err)
@@ -1000,6 +1023,16 @@ func (s *Server) batchDeleteMemories(w http.ResponseWriter, r *http.Request) {
 				s.handleError(r.Context(), w, err)
 				return
 			}
+			sessionDeleted, sessionErr := group.target.svc.session.BulkDelete(r.Context(), group.ids, auth.AgentName)
+			if sessionErr != nil && !errors.Is(sessionErr, domain.ErrNotSupported) {
+				if s.runtimeUsageEnabled() {
+					s.runtimeUsage.AfterMemoryDeleteFailure(context.Background(), lease, sessionErr)
+					finalized = true
+				}
+				s.handleError(r.Context(), w, sessionErr)
+				return
+			}
+			groupDeleted += sessionDeleted
 			if s.runtimeUsageEnabled() {
 				if err := withRuntimeUsagePostSuccessContext(func(ctx context.Context) error {
 					return s.runtimeUsage.AfterMemoryDeleteSuccess(ctx, lease, runtimeusage.MemoryDeleteResult{
@@ -1063,6 +1096,16 @@ func (s *Server) batchDeleteMemories(w http.ResponseWriter, r *http.Request) {
 		s.handleError(r.Context(), w, err)
 		return
 	}
+	sessionDeleted, sessionErr := svc.session.BulkDelete(r.Context(), deleteIDs, auth.AgentName)
+	if sessionErr != nil && !errors.Is(sessionErr, domain.ErrNotSupported) {
+		if s.runtimeUsageEnabled() {
+			s.runtimeUsage.AfterMemoryDeleteFailure(context.Background(), lease, sessionErr)
+			finalized = true
+		}
+		s.handleError(r.Context(), w, sessionErr)
+		return
+	}
+	deleted += sessionDeleted
 	if s.runtimeUsageEnabled() {
 		if err := withRuntimeUsagePostSuccessContext(func(ctx context.Context) error {
 			return s.runtimeUsage.AfterMemoryDeleteSuccess(ctx, lease, runtimeusage.MemoryDeleteResult{

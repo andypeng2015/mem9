@@ -59,6 +59,14 @@ type chainDeleteGroup struct {
 }
 
 func (s *Server) findChainMemoryTarget(ctx context.Context, auth *domain.AuthInfo, id string) (chainMemoryTarget, error) {
+	return s.findChainMemoryTargetWithOptions(ctx, auth, id, false)
+}
+
+func (s *Server) findChainDeleteTarget(ctx context.Context, auth *domain.AuthInfo, id string) (chainMemoryTarget, error) {
+	return s.findChainMemoryTargetWithOptions(ctx, auth, id, true)
+}
+
+func (s *Server) findChainMemoryTargetWithOptions(ctx context.Context, auth *domain.AuthInfo, id string, includeSessions bool) (chainMemoryTarget, error) {
 	if auth == nil || auth.Chain == nil || len(auth.Chain.Nodes) == 0 {
 		return chainMemoryTarget{}, &domain.ValidationError{Message: "Space Chain has no nodes."}
 	}
@@ -67,9 +75,18 @@ func (s *Server) findChainMemoryTarget(ctx context.Context, auth *domain.AuthInf
 		svc := s.resolveServices(nodeAuth)
 		if _, err := svc.memory.Get(ctx, id); err != nil {
 			if errors.Is(err, domain.ErrNotFound) {
-				continue
+				if !includeSessions {
+					continue
+				}
+				if _, sessionErr := svc.session.Get(ctx, id); sessionErr != nil {
+					if errors.Is(sessionErr, domain.ErrNotFound) || errors.Is(sessionErr, domain.ErrNotSupported) {
+						continue
+					}
+					return chainMemoryTarget{}, sessionErr
+				}
+			} else {
+				return chainMemoryTarget{}, err
 			}
-			return chainMemoryTarget{}, err
 		}
 		return chainMemoryTarget{
 			nodeAuth: nodeAuth,
@@ -88,7 +105,7 @@ func (s *Server) chainDeleteGroups(ctx context.Context, auth *domain.AuthInfo, i
 	groups := make([]chainDeleteGroup, 0)
 	groupIndexes := make(map[string]int)
 	for _, id := range deleteIDs {
-		target, err := s.findChainMemoryTarget(ctx, auth, id)
+		target, err := s.findChainDeleteTarget(ctx, auth, id)
 		if err != nil {
 			if errors.Is(err, domain.ErrNotFound) {
 				continue
@@ -125,6 +142,7 @@ func (s *Server) listChainMemories(ctx context.Context, auth *domain.AuthInfo, f
 	stopEligible := false
 	stopBlockedReason := ""
 	queryMode := filter.Query != ""
+	scanAll := filter.ScanAll
 	profile := buildRecallQueryProfile(filter.Query)
 
 	perNodeFilter := filter
@@ -150,6 +168,8 @@ func (s *Server) listChainMemories(ctx context.Context, auth *domain.AuthInfo, f
 			perNodeFilter.MemoryType == string(domain.TypePinned) ||
 			perNodeFilter.MemoryType == string(domain.TypeInsight)):
 			memories, _, err = s.singlePoolConfidenceRecallSearch(ctx, nodeAuth, svc, perNodeFilter)
+		case perNodeFilter.MemoryType == string(domain.TypeSession):
+			memories, _, err = svc.session.List(ctx, perNodeFilter)
 		case perNodeFilter.MemoryType != string(domain.TypeSession):
 			memories, _, err = svc.memory.Search(ctx, perNodeFilter)
 		}
@@ -170,9 +190,12 @@ func (s *Server) listChainMemories(ctx context.Context, auth *domain.AuthInfo, f
 			}
 			stopEligible = decision.eligible
 			stopBlockedReason = decision.blockedReason
-			if decision.stop {
+			if decision.stop && !scanAll {
 				stopReason = "threshold_hit"
 				break
+			}
+			if decision.stop && scanAll {
+				stopReason = "scan_all"
 			}
 		}
 	}
@@ -188,6 +211,7 @@ func (s *Server) listChainMemories(ctx context.Context, auth *domain.AuthInfo, f
 		"stop_eligible", stopEligible,
 		"stop_blocked_reason", stopBlockedReason,
 		"threshold", s.chainRecallStopScore,
+		"scan_all", scanAll,
 		"returned", len(memories),
 	)
 	return memories, totalBeforePage, nil
@@ -279,9 +303,16 @@ func (s *Server) getChainMemory(ctx context.Context, auth *domain.AuthInfo, id s
 		mem, err := svc.memory.Get(ctx, id)
 		if err != nil {
 			if errors.Is(err, domain.ErrNotFound) {
-				continue
+				mem, err = svc.session.Get(ctx, id)
+				if err != nil {
+					if errors.Is(err, domain.ErrNotFound) || errors.Is(err, domain.ErrNotSupported) {
+						continue
+					}
+					return nil, err
+				}
+			} else {
+				return nil, err
 			}
-			return nil, err
 		}
 		mem.ChainSource = chainSource(auth, node)
 		return mem, nil
@@ -314,10 +345,15 @@ func finalizeChainMemories(memories []domain.Memory, limit, offset int, queryMod
 	memories = uniqueChainMemories(memories)
 	if queryMode {
 		sort.SliceStable(memories, func(i, j int) bool {
-			left := chainRankScore(memories[i])
-			right := chainRankScore(memories[j])
-			if left != right {
-				return left > right
+			leftConfidence := chainStopConfidence(memories[i])
+			rightConfidence := chainStopConfidence(memories[j])
+			if leftConfidence != rightConfidence {
+				return leftConfidence > rightConfidence
+			}
+			leftScore := chainRankScore(memories[i])
+			rightScore := chainRankScore(memories[j])
+			if leftScore != rightScore {
+				return leftScore > rightScore
 			}
 			return memories[i].UpdatedAt.After(memories[j].UpdatedAt)
 		})

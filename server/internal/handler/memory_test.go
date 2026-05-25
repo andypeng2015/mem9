@@ -35,6 +35,7 @@ type testMemoryRepo struct {
 	lastKeywordFilter    domain.MemoryFilter
 	softDeleteCalls      []string
 	softDeleteResult     int64
+	softDeleteErr        error
 	bulkSoftDeleteCalls  [][]string
 	bulkSoftDeleteResult int64
 	countStatsTotal      int64
@@ -78,6 +79,9 @@ func (m *testMemoryRepo) SoftDelete(_ context.Context, id string, _ string) (int
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.softDeleteCalls = append(m.softDeleteCalls, id)
+	if m.softDeleteErr != nil {
+		return 0, m.softDeleteErr
+	}
 	if m.softDeleteResult != 0 {
 		return m.softDeleteResult, nil
 	}
@@ -165,6 +169,16 @@ type testSessionRepo struct {
 	sessionListResults   []*domain.Session
 	lastSessionIDs       []string
 	lastSessionLimit     int
+	getResult            *domain.Memory
+	getErr               error
+	listResults          []domain.Memory
+	listTotal            int
+	lastListFilter       domain.MemoryFilter
+	listCalls            int
+	softDeleteCalls      []string
+	softDeleteErr        error
+	bulkSoftDeleteCalls  [][]string
+	bulkSoftDeleteResult int64
 }
 
 func (s *testSessionRepo) BulkCreate(_ context.Context, sessions []*domain.Session) error {
@@ -183,6 +197,47 @@ func (s *testSessionRepo) PatchTags(_ context.Context, sessionID, hash string, t
 	s.patchedHash = hash
 	s.patchedTags = append([]string(nil), tags...)
 	return nil
+}
+
+func (s *testSessionRepo) GetByID(_ context.Context, id string) (*domain.Memory, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.getErr != nil {
+		return nil, s.getErr
+	}
+	if s.getResult != nil && s.getResult.ID == id {
+		cp := *s.getResult
+		return &cp, nil
+	}
+	return nil, domain.ErrNotFound
+}
+
+func (s *testSessionRepo) List(_ context.Context, filter domain.MemoryFilter) ([]domain.Memory, int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.listCalls++
+	s.lastListFilter = filter
+	return append([]domain.Memory(nil), s.listResults...), s.listTotal, nil
+}
+
+func (s *testSessionRepo) SoftDelete(_ context.Context, id, _ string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.softDeleteCalls = append(s.softDeleteCalls, id)
+	if s.softDeleteErr != nil {
+		return 0, s.softDeleteErr
+	}
+	return 1, nil
+}
+
+func (s *testSessionRepo) BulkSoftDelete(_ context.Context, ids []string, _ string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.bulkSoftDeleteCalls = append(s.bulkSoftDeleteCalls, append([]string(nil), ids...))
+	if s.bulkSoftDeleteResult != 0 {
+		return s.bulkSoftDeleteResult, nil
+	}
+	return 0, nil
 }
 
 func (s *testSessionRepo) AutoVectorSearch(context.Context, string, domain.MemoryFilter, int) ([]domain.Memory, error) {
@@ -457,6 +512,205 @@ func newTestServer(memRepo *testMemoryRepo, sessRepo *testSessionRepo) *Server {
 	return srv
 }
 
+func TestListMemories_SessionTypeListsSessionRows(t *testing.T) {
+	sessionRepo := &testSessionRepo{
+		listResults: []domain.Memory{
+			{
+				ID:         "sess-row-1",
+				Content:    "hello from a raw turn",
+				MemoryType: domain.TypeSession,
+				State:      domain.StateActive,
+				CreatedAt:  time.Now(),
+				UpdatedAt:  time.Now(),
+			},
+		},
+		listTotal: 7,
+	}
+	srv := newTestServer(&testMemoryRepo{}, sessionRepo)
+	req := makeRequest(t, http.MethodGet, "/memories?memory_type=session&limit=10&offset=20&state=active&agent_id=codex&session_id=sess-1&source=cli&tags=alpha,beta", nil)
+	rr := httptest.NewRecorder()
+
+	srv.listMemories(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+	var resp listResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Total != 7 || resp.Limit != 10 || resp.Offset != 20 {
+		t.Fatalf("page = total:%d limit:%d offset:%d, want 7/10/20", resp.Total, resp.Limit, resp.Offset)
+	}
+	if len(resp.Memories) != 1 || resp.Memories[0].MemoryType != domain.TypeSession {
+		t.Fatalf("memories = %+v, want one session memory", resp.Memories)
+	}
+	if sessionRepo.lastListFilter.MemoryType != "session" ||
+		sessionRepo.lastListFilter.AgentID != "codex" ||
+		sessionRepo.lastListFilter.SessionID != "sess-1" ||
+		sessionRepo.lastListFilter.Source != "cli" ||
+		len(sessionRepo.lastListFilter.Tags) != 2 {
+		t.Fatalf("session list filter = %+v", sessionRepo.lastListFilter)
+	}
+}
+
+func TestListMemories_ChainSessionTypeListsSessionRowsWithoutQuery(t *testing.T) {
+	now := time.Now()
+	sessionRepo := &testSessionRepo{
+		listResults: []domain.Memory{
+			{
+				ID:         "sess-row-1",
+				Content:    "hello from a raw turn",
+				MemoryType: domain.TypeSession,
+				State:      domain.StateActive,
+				CreatedAt:  now,
+				UpdatedAt:  now,
+			},
+		},
+		listTotal: 1,
+	}
+	srv := newTestServer(&testMemoryRepo{}, sessionRepo)
+	req := makeChainRequestWithNodes(t, http.MethodGet, "/memories?memory_type=session&limit=10&offset=0&state=active", nil, 2)
+	rr := httptest.NewRecorder()
+
+	srv.listMemories(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+	var resp listResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if sessionRepo.listCalls != 2 {
+		t.Fatalf("session list calls = %d, want one per chain node", sessionRepo.listCalls)
+	}
+	if resp.Total != 1 {
+		t.Fatalf("total = %d, want deduplicated total 1", resp.Total)
+	}
+	if len(resp.Memories) != 1 || resp.Memories[0].MemoryType != domain.TypeSession {
+		t.Fatalf("memories = %+v, want one session memory", resp.Memories)
+	}
+	if resp.Memories[0].ChainSource == nil || resp.Memories[0].ChainSource.ChainID != "chain-a" {
+		t.Fatalf("chain source = %+v, want chain-a", resp.Memories[0].ChainSource)
+	}
+	if sessionRepo.lastListFilter.MemoryType != "session" || sessionRepo.lastListFilter.State != "active" {
+		t.Fatalf("session list filter = %+v", sessionRepo.lastListFilter)
+	}
+}
+
+func TestGetMemory_FallsBackToSessionRow(t *testing.T) {
+	sessionRepo := &testSessionRepo{
+		getResult: &domain.Memory{
+			ID:         "sess-row-1",
+			Content:    "raw turn",
+			MemoryType: domain.TypeSession,
+			State:      domain.StateActive,
+			CreatedAt:  time.Now(),
+			UpdatedAt:  time.Now(),
+		},
+	}
+	srv := newTestServer(&testMemoryRepo{}, sessionRepo)
+	req := makeRequest(t, http.MethodGet, "/memories/sess-row-1", nil)
+	req = withURLParam(req, "id", "sess-row-1")
+	rr := httptest.NewRecorder()
+
+	srv.getMemory(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"memory_type":"session"`) {
+		t.Fatalf("body = %s, want session memory type", rr.Body.String())
+	}
+}
+
+func TestGetMemory_SessionUnsupportedFallbackReturnsNotFound(t *testing.T) {
+	sessionRepo := &testSessionRepo{getErr: domain.ErrNotSupported}
+	srv := newTestServer(&testMemoryRepo{}, sessionRepo)
+	req := makeRequest(t, http.MethodGet, "/memories/missing-id", nil)
+	req = withURLParam(req, "id", "missing-id")
+	rr := httptest.NewRecorder()
+
+	srv.getMemory(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestGetMemory_ChainFallsBackToSessionRow(t *testing.T) {
+	sessionRepo := &testSessionRepo{
+		getResult: &domain.Memory{
+			ID:         "sess-row-1",
+			Content:    "raw turn",
+			MemoryType: domain.TypeSession,
+			State:      domain.StateActive,
+			CreatedAt:  time.Now(),
+			UpdatedAt:  time.Now(),
+		},
+	}
+	srv := newTestServer(&testMemoryRepo{}, sessionRepo)
+	req := withURLParam(makeChainRequest(t, http.MethodGet, "/memories/sess-row-1", nil), "id", "sess-row-1")
+	rr := httptest.NewRecorder()
+
+	srv.getMemory(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"memory_type":"session"`) {
+		t.Fatalf("body = %s, want session memory type", rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"chain_source"`) {
+		t.Fatalf("body = %s, want chain source", rr.Body.String())
+	}
+}
+
+func TestDeleteMemory_FallsBackToSessionRow(t *testing.T) {
+	memRepo := &testMemoryRepo{softDeleteErr: domain.ErrNotFound}
+	sessionRepo := &testSessionRepo{}
+	srv := newTestServer(memRepo, sessionRepo)
+	req := makeRequest(t, http.MethodDelete, "/memories/sess-row-1", nil)
+	req = withURLParam(req, "id", "sess-row-1")
+	rr := httptest.NewRecorder()
+
+	srv.deleteMemory(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204: %s", rr.Code, rr.Body.String())
+	}
+	if len(sessionRepo.softDeleteCalls) != 1 || sessionRepo.softDeleteCalls[0] != "sess-row-1" {
+		t.Fatalf("session delete calls = %+v, want sess-row-1", sessionRepo.softDeleteCalls)
+	}
+}
+
+func TestDeleteMemory_ChainFallsBackToSessionRow(t *testing.T) {
+	memRepo := &testMemoryRepo{softDeleteErr: domain.ErrNotFound}
+	sessionRepo := &testSessionRepo{
+		getResult: &domain.Memory{
+			ID:         "sess-row-1",
+			Content:    "raw turn",
+			MemoryType: domain.TypeSession,
+			State:      domain.StateActive,
+			CreatedAt:  time.Now(),
+			UpdatedAt:  time.Now(),
+		},
+	}
+	srv := newTestServer(memRepo, sessionRepo)
+	req := withURLParam(makeChainRequest(t, http.MethodDelete, "/memories/sess-row-1", nil), "id", "sess-row-1")
+	rr := httptest.NewRecorder()
+
+	srv.deleteMemory(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204: %s", rr.Code, rr.Body.String())
+	}
+	if len(sessionRepo.softDeleteCalls) != 1 || sessionRepo.softDeleteCalls[0] != "sess-row-1" {
+		t.Fatalf("session delete calls = %+v, want sess-row-1", sessionRepo.softDeleteCalls)
+	}
+}
+
 // makeRequest creates an HTTP request with auth context injected.
 func makeRequest(t *testing.T, method, path string, body any) *http.Request {
 	t.Helper()
@@ -488,21 +742,28 @@ func makeTenantRequest(t *testing.T, method, path string, body any) *http.Reques
 
 func makeChainRequest(t *testing.T, method, path string, body any) *http.Request {
 	t.Helper()
+	return makeChainRequestWithNodes(t, method, path, body, 1)
+}
+
+func makeChainRequestWithNodes(t *testing.T, method, path string, body any, count int) *http.Request {
+	t.Helper()
 	req := makeRequest(t, method, path, body)
+	nodes := make([]domain.ChainAuthNode, 0, count)
+	for i := 0; i < count; i++ {
+		nodes = append(nodes, domain.ChainAuthNode{
+			SpaceChainNode: domain.SpaceChainNode{
+				TenantID: "tenant-a",
+				Position: i + 1,
+			},
+			ClusterID: "10006636",
+		})
+	}
 	auth := &domain.AuthInfo{
 		AgentName: "test-agent",
 		Chain: &domain.ChainAuth{
 			ChainID: "chain-a",
 			APIKey:  "chain-key-a",
-			Nodes: []domain.ChainAuthNode{
-				{
-					SpaceChainNode: domain.SpaceChainNode{
-						TenantID: "tenant-a",
-						Position: 1,
-					},
-					ClusterID: "10006636",
-				},
-			},
+			Nodes:   nodes,
 		},
 	}
 	ctx := middleware.WithAuthContext(req.Context(), auth)
@@ -1287,6 +1548,64 @@ func TestListMemories_ChainRuntimeUsageRecallUsesChainAPIKeySubject(t *testing.T
 	}
 	if len(runtimeUsage.beforeRecallSubjects) != 1 || runtimeUsage.beforeRecallSubjects[0].APIKeySubject != "chain-key-a" {
 		t.Fatalf("recall subject = %+v, want chain-key-a API key subject", runtimeUsage.beforeRecallSubjects)
+	}
+}
+
+func TestListMemories_ChainStopsAfterHighConfidenceByDefault(t *testing.T) {
+	now := time.Now()
+	calls := 0
+	sessionRepo := &testSessionRepo{
+		keywordSearchHook: func(_ context.Context, _ string, _ domain.MemoryFilter, _ int) ([]domain.Memory, error) {
+			calls++
+			return []domain.Memory{
+				{ID: "session-memory", Content: "Bosn's timezone is Asia/Shanghai.", MemoryType: domain.TypeSession, UpdatedAt: now, State: domain.StateActive},
+			}, nil
+		},
+	}
+	srv := newTestServer(&testMemoryRepo{}, sessionRepo)
+	srv.chainRecallStopScore = 0.1
+
+	req := makeChainRequestWithNodes(t, http.MethodGet, "/memories?q=what%20timezone%20does%20Bosn%20use&memory_type=session&limit=10", nil, 2)
+	rr := httptest.NewRecorder()
+
+	srv.listMemories(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+	if calls != 1 {
+		t.Fatalf("node searches = %d, want 1", calls)
+	}
+}
+
+func TestListMemories_ChainScanAllContinuesPastHighConfidence(t *testing.T) {
+	now := time.Now()
+	calls := 0
+	sessionRepo := &testSessionRepo{
+		keywordSearchHook: func(_ context.Context, _ string, _ domain.MemoryFilter, _ int) ([]domain.Memory, error) {
+			calls++
+			id := "session-memory-a"
+			if calls > 1 {
+				id = "session-memory-b"
+			}
+			return []domain.Memory{
+				{ID: id, Content: "Bosn's timezone is Asia/Shanghai.", MemoryType: domain.TypeSession, UpdatedAt: now, State: domain.StateActive},
+			}, nil
+		},
+	}
+	srv := newTestServer(&testMemoryRepo{}, sessionRepo)
+	srv.chainRecallStopScore = 0.1
+
+	req := makeChainRequestWithNodes(t, http.MethodGet, "/memories?q=what%20timezone%20does%20Bosn%20use&memory_type=session&limit=10&scanAll=true", nil, 2)
+	rr := httptest.NewRecorder()
+
+	srv.listMemories(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+	if calls != 2 {
+		t.Fatalf("node searches = %d, want 2", calls)
 	}
 }
 
