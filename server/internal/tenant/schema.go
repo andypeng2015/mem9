@@ -150,12 +150,12 @@ const TenantSessionsSchemaBase = `CREATE TABLE IF NOT EXISTS sessions (
     state        VARCHAR(20)     NOT NULL DEFAULT 'active',
     created_at   TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
     updated_at   TIMESTAMP       DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    INDEX        idx_sessions_session (session_id),
-    INDEX        idx_sessions_agent   (agent_id),
-    INDEX        idx_sessions_app     (app_id),
-    INDEX        idx_sessions_state   (state),
-    INDEX        idx_sessions_created (created_at),
-    UNIQUE INDEX idx_sessions_dedup   (app_id, session_id, content_hash)
+    INDEX        idx_sess_session (session_id),
+    INDEX        idx_sess_agent   (agent_id),
+    INDEX        idx_sess_app     (app_id),
+    INDEX        idx_sess_state   (state),
+    INDEX        idx_sess_created (created_at),
+    UNIQUE INDEX idx_sess_dedup   (app_id, session_id, content_hash)
 )`
 
 // BuildSessionsSchema builds the TiDB sessions schema with optional auto-embedding.
@@ -179,109 +179,231 @@ func BuildSessionsSchema(autoModel string, autoDims int, clientDims int) string 
 
 // InitTiDBTenantSchema creates or completes the TiDB tenant data-plane schema.
 func InitTiDBTenantSchema(ctx context.Context, db *sql.DB, autoModel string, autoDims int, clientDims int, ftsEnabled bool) error {
+	if err := EnsureTiDBTenantRuntimeSchema(ctx, db, autoModel, autoDims, clientDims, ftsEnabled); err != nil {
+		return fmt.Errorf("init schema: %w", err)
+	}
+	return nil
+}
+
+// EnsureTiDBTenantRuntimeSchema creates missing tenant tables and search indexes,
+// then validates the offline-migrated app-scoped schema without mutating it.
+func EnsureTiDBTenantRuntimeSchema(ctx context.Context, db *sql.DB, autoModel string, autoDims int, clientDims int, ftsEnabled bool) error {
+	if err := ensureTiDBTenantTablesAndSearchIndexes(ctx, db, autoModel, autoDims, clientDims, ftsEnabled); err != nil {
+		return err
+	}
+	if err := ValidateTiDBTenantRuntimeSchema(ctx, db, autoModel, ftsEnabled); err != nil {
+		return fmt.Errorf("runtime validation: %w", err)
+	}
+	return nil
+}
+
+func ensureTiDBTenantTablesAndSearchIndexes(ctx context.Context, db *sql.DB, autoModel string, autoDims int, clientDims int, ftsEnabled bool) error {
 	if db == nil {
-		return fmt.Errorf("init schema: db connection is nil")
+		return fmt.Errorf("db connection is nil")
 	}
 
 	if err := CheckEmbeddingSchemaCompatibility(ctx, db, autoModel); err != nil {
-		return fmt.Errorf("init schema: embedding schema compatibility: %w", err)
+		return fmt.Errorf("embedding schema compatibility: %w", err)
 	}
 
 	if err := ensureTable(ctx, db, "memories", BuildMemorySchema(autoModel, autoDims, clientDims)); err != nil {
-		return fmt.Errorf("init schema: memories table: %w", err)
-	}
-	if err := ensureColumn(ctx, db, "memories", "app_id", "VARCHAR(100) NOT NULL DEFAULT ''"); err != nil {
-		return fmt.Errorf("init schema: memories app_id column: %w", err)
-	}
-	if err := ensurePlainIndex(ctx, db, "memories", "idx_app", "app_id"); err != nil {
-		return fmt.Errorf("init schema: memories app_id index: %w", err)
+		return fmt.Errorf("memories table: %w", err)
 	}
 	if err := ensureVectorIndex(ctx, db, "memories", "idx_cosine"); err != nil {
-		return fmt.Errorf("init schema: memories vector index: %w", err)
+		return fmt.Errorf("memories vector index: %w", err)
 	}
 	if ftsEnabled {
 		if err := ensureFullTextIndex(ctx, db, "memories", "idx_fts_content"); err != nil {
-			return fmt.Errorf("init schema: memories fulltext index: %w", err)
+			return fmt.Errorf("memories fulltext index: %w", err)
 		}
 	}
 
 	if err := ensureTable(ctx, db, "sessions", BuildSessionsSchema(autoModel, autoDims, clientDims)); err != nil {
-		return fmt.Errorf("init schema: sessions table: %w", err)
+		return fmt.Errorf("sessions table: %w", err)
 	}
-	if err := ensureColumn(ctx, db, "sessions", "app_id", "VARCHAR(100) NOT NULL DEFAULT ''"); err != nil {
-		return fmt.Errorf("init schema: sessions app_id column: %w", err)
-	}
-	if err := ensurePlainIndex(ctx, db, "sessions", "idx_sessions_app", "app_id"); err != nil {
-		return fmt.Errorf("init schema: sessions app_id index: %w", err)
-	}
-	if err := ensureSessionsDedupIndex(ctx, db); err != nil {
-		return fmt.Errorf("init schema: sessions app_id dedup index: %w", err)
-	}
-	if err := ensureVectorIndex(ctx, db, "sessions", "idx_sessions_cosine"); err != nil {
-		return fmt.Errorf("init schema: sessions vector index: %w", err)
+	if err := ensureVectorIndex(ctx, db, "sessions", "idx_sess_cosine"); err != nil {
+		return fmt.Errorf("sessions vector index: %w", err)
 	}
 	if ftsEnabled {
-		if err := ensureFullTextIndex(ctx, db, "sessions", "idx_sessions_fts"); err != nil {
-			return fmt.Errorf("init schema: sessions fulltext index: %w", err)
+		if err := ensureFullTextIndex(ctx, db, "sessions", "idx_sess_fts"); err != nil {
+			return fmt.Errorf("sessions fulltext index: %w", err)
 		}
 	}
 	return nil
 }
 
-func ensureColumn(ctx context.Context, db *sql.DB, table, column, definition string) error {
+// ValidateTiDBTenantRuntimeSchema checks the tenant schema expected after
+// provisioning or offline migration without mutating existing tables.
+func ValidateTiDBTenantRuntimeSchema(ctx context.Context, db *sql.DB, autoModel string, ftsEnabled bool) error {
+	if db == nil {
+		return fmt.Errorf("validate schema: db connection is nil")
+	}
+	if err := CheckEmbeddingSchemaCompatibility(ctx, db, autoModel); err != nil {
+		return fmt.Errorf("validate schema: embedding schema compatibility: %w", err)
+	}
+
+	if err := requireTable(ctx, db, "memories"); err != nil {
+		return fmt.Errorf("validate schema: memories table: %w", err)
+	}
+	if err := requireColumn(ctx, db, "memories", "app_id"); err != nil {
+		return fmt.Errorf("validate schema: memories app_id column: %w", err)
+	}
+	if err := requireIndex(ctx, db, "memories", "idx_app"); err != nil {
+		return fmt.Errorf("validate schema: memories app_id index: %w", err)
+	}
+	if err := requireIndex(ctx, db, "memories", "idx_cosine"); err != nil {
+		return fmt.Errorf("validate schema: memories vector index: %w", err)
+	}
+	if ftsEnabled {
+		if err := requireIndex(ctx, db, "memories", "idx_fts_content"); err != nil {
+			return fmt.Errorf("validate schema: memories fulltext index: %w", err)
+		}
+	}
+
+	if err := requireTable(ctx, db, "sessions"); err != nil {
+		return fmt.Errorf("validate schema: sessions table: %w", err)
+	}
+	if err := requireColumn(ctx, db, "sessions", "app_id"); err != nil {
+		return fmt.Errorf("validate schema: sessions app_id column: %w", err)
+	}
+	if err := requireIndex(ctx, db, "sessions", "idx_sess_app"); err != nil {
+		return fmt.Errorf("validate schema: sessions app_id index: %w", err)
+	}
+	if err := requireUniqueIndexColumns(ctx, db, "sessions", "idx_sess_dedup", []string{"app_id", "session_id", "content_hash"}); err != nil {
+		return fmt.Errorf("validate schema: sessions dedup index: %w", err)
+	}
+	if err := requireIndex(ctx, db, "sessions", "idx_sess_cosine"); err != nil {
+		return fmt.Errorf("validate schema: sessions vector index: %w", err)
+	}
+	if ftsEnabled {
+		if err := requireIndex(ctx, db, "sessions", "idx_sess_fts"); err != nil {
+			return fmt.Errorf("validate schema: sessions fulltext index: %w", err)
+		}
+	}
+	return nil
+}
+
+func ValidatePostgresMemoryRuntimeSchema(ctx context.Context, db *sql.DB, backend string) error {
+	if db == nil {
+		return fmt.Errorf("validate schema: db connection is nil")
+	}
+	if err := requirePostgresColumn(ctx, db, "memories", "app_id"); err != nil {
+		return fmt.Errorf("validate schema: memories app_id column: %w", err)
+	}
+	indexName := "idx_app"
+	if backend == "db9" {
+		indexName = "idx_memory_app"
+	}
+	if err := requirePostgresIndex(ctx, db, "memories", indexName); err != nil {
+		return fmt.Errorf("validate schema: memories app_id index: %w", err)
+	}
+	return nil
+}
+
+func requireTable(ctx context.Context, db *sql.DB, table string) error {
+	exists, err := TableExists(ctx, db, table)
+	if err != nil {
+		return fmt.Errorf("check table: %w", err)
+	}
+	if !exists {
+		return fmt.Errorf("%s table is missing", table)
+	}
+	return nil
+}
+
+func requireColumn(ctx context.Context, db *sql.DB, table, column string) error {
 	exists, err := ColumnExists(ctx, db, table, column)
 	if err != nil {
 		return fmt.Errorf("check column: %w", err)
 	}
-	if exists {
-		return nil
-	}
-	if _, err := db.ExecContext(ctx, fmt.Sprintf(
-		"ALTER TABLE %s ADD COLUMN %s %s",
-		table, column, definition,
-	)); err != nil && !IsDuplicateColumnError(err) {
-		return fmt.Errorf("add column: %w", err)
+	if !exists {
+		return fmt.Errorf("%s.%s is missing", table, column)
 	}
 	return nil
 }
 
-func ensurePlainIndex(ctx context.Context, db *sql.DB, table, indexName, columns string) error {
+func requireIndex(ctx context.Context, db *sql.DB, table, indexName string) error {
 	exists, err := IndexExists(ctx, db, table, indexName)
 	if err != nil {
 		return fmt.Errorf("check index: %w", err)
 	}
-	if exists {
-		return nil
-	}
-	if _, err := db.ExecContext(ctx, fmt.Sprintf(
-		"CREATE INDEX %s ON %s(%s)",
-		indexName, table, columns,
-	)); err != nil && !IsIndexExistsError(err) {
-		return fmt.Errorf("create index: %w", err)
+	if !exists {
+		return fmt.Errorf("%s.%s is missing", table, indexName)
 	}
 	return nil
 }
 
-func ensureSessionsDedupIndex(ctx context.Context, db *sql.DB) error {
-	columns, err := indexColumns(ctx, db, "sessions", "idx_sessions_dedup")
+func requirePostgresColumn(ctx context.Context, db *sql.DB, table, column string) error {
+	exists, err := postgresColumnExists(ctx, db, table, column)
 	if err != nil {
-		return fmt.Errorf("check dedup index columns: %w", err)
+		return fmt.Errorf("check column: %w", err)
 	}
-	if strings.Join(columns, ",") == "app_id,session_id,content_hash" {
-		return nil
-	}
-	if _, err := db.ExecContext(ctx, `ALTER TABLE sessions DROP INDEX idx_sessions_dedup`); err != nil && !IsIndexNotFoundError(err) {
-		return fmt.Errorf("drop old dedup index: %w", err)
-	}
-	if _, err := db.ExecContext(ctx, `ALTER TABLE sessions ADD UNIQUE INDEX idx_sessions_dedup (app_id, session_id, content_hash)`); err != nil && !IsIndexExistsError(err) {
-		return fmt.Errorf("add app scoped dedup index: %w", err)
+	if !exists {
+		return fmt.Errorf("%s.%s is missing", table, column)
 	}
 	return nil
 }
 
-func indexColumns(ctx context.Context, db *sql.DB, table, indexName string) ([]string, error) {
+func postgresColumnExists(ctx context.Context, db *sql.DB, table, column string) (bool, error) {
+	var count int
+	err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*)
+		   FROM information_schema.columns
+		  WHERE table_schema = current_schema()
+		    AND table_name = $1
+		    AND column_name = $2`,
+		table, column,
+	).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func requirePostgresIndex(ctx context.Context, db *sql.DB, table, indexName string) error {
+	exists, err := postgresIndexExists(ctx, db, table, indexName)
+	if err != nil {
+		return fmt.Errorf("check index: %w", err)
+	}
+	if !exists {
+		return fmt.Errorf("%s.%s is missing", table, indexName)
+	}
+	return nil
+}
+
+func postgresIndexExists(ctx context.Context, db *sql.DB, table, indexName string) (bool, error) {
+	var count int
+	err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*)
+		   FROM pg_indexes
+		  WHERE schemaname = current_schema()
+		    AND tablename = $1
+		    AND indexname = $2`,
+		table, indexName,
+	).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func requireUniqueIndexColumns(ctx context.Context, db *sql.DB, table, indexName string, want []string) error {
+	columns, unique, err := indexDefinition(ctx, db, table, indexName)
+	if err != nil {
+		return fmt.Errorf("check index columns: %w", err)
+	}
+	if strings.Join(columns, ",") != strings.Join(want, ",") {
+		return fmt.Errorf("%s.%s columns = %q, want %q", table, indexName, strings.Join(columns, ","), strings.Join(want, ","))
+	}
+	if !unique {
+		return fmt.Errorf("%s.%s is not unique", table, indexName)
+	}
+	return nil
+}
+
+func indexDefinition(ctx context.Context, db *sql.DB, table, indexName string) ([]string, bool, error) {
 	rows, err := db.QueryContext(ctx,
-		`SELECT COLUMN_NAME
+		`SELECT COLUMN_NAME, NON_UNIQUE
 		   FROM information_schema.STATISTICS
 		  WHERE TABLE_SCHEMA = DATABASE()
 		    AND TABLE_NAME = ?
@@ -290,54 +412,24 @@ func indexColumns(ctx context.Context, db *sql.DB, table, indexName string) ([]s
 		table, indexName,
 	)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer rows.Close()
 
 	var columns []string
+	unique := true
 	for rows.Next() {
 		var column string
-		if err := rows.Scan(&column); err != nil {
-			return nil, err
+		var nonUnique int
+		if err := rows.Scan(&column, &nonUnique); err != nil {
+			return nil, false, err
 		}
 		columns = append(columns, column)
+		if nonUnique != 0 {
+			unique = false
+		}
 	}
-	return columns, rows.Err()
-}
-
-// EnsureMemoryAppIDSchema completes the app-scoped memory schema for existing tenants.
-func EnsureMemoryAppIDSchema(ctx context.Context, db *sql.DB) error {
-	if err := ensureColumn(ctx, db, "memories", "app_id", "VARCHAR(100) NOT NULL DEFAULT ''"); err != nil {
-		return err
-	}
-	return ensurePlainIndex(ctx, db, "memories", "idx_app", "app_id")
-}
-
-// EnsurePostgresMemoryAppIDSchema completes the app-scoped memory schema for
-// PostgreSQL-compatible tenant databases.
-func EnsurePostgresMemoryAppIDSchema(ctx context.Context, db *sql.DB, backend string) error {
-	if _, err := db.ExecContext(ctx, `ALTER TABLE memories ADD COLUMN IF NOT EXISTS app_id VARCHAR(100) NOT NULL DEFAULT ''`); err != nil {
-		return fmt.Errorf("memories app_id column: %w", err)
-	}
-	indexName := "idx_app"
-	if backend == "db9" {
-		indexName = "idx_memory_app"
-	}
-	if _, err := db.ExecContext(ctx, fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON memories(app_id)`, indexName)); err != nil {
-		return fmt.Errorf("memories app_id index: %w", err)
-	}
-	return nil
-}
-
-// EnsureSessionsAppIDSchema completes the app-scoped raw session schema for existing tenants.
-func EnsureSessionsAppIDSchema(ctx context.Context, db *sql.DB) error {
-	if err := ensureColumn(ctx, db, "sessions", "app_id", "VARCHAR(100) NOT NULL DEFAULT ''"); err != nil {
-		return err
-	}
-	if err := ensurePlainIndex(ctx, db, "sessions", "idx_sessions_app", "app_id"); err != nil {
-		return err
-	}
-	return ensureSessionsDedupIndex(ctx, db)
+	return columns, unique, rows.Err()
 }
 
 func ensureTable(ctx context.Context, db *sql.DB, table, createSQL string) error {
